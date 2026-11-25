@@ -72,12 +72,15 @@ def main():
     seq_len = model.config.block_size  # 2,048
     log(f"model: {sum(p.numel() for p in model.parameters()):,} parameters on {device}")
 
-    # ---- 3. Data: each training sequence comes from one of the four pools, chosen uniformly -----------
-    pools = [data.read_tokens(os.path.join(ROOT, "pool", f"{d}.bin")) for d in DOMAINS]
+    # ---- 3. Data: hold out a validation tail per domain; train only on the rest -----------------------
+    VAL_TOKENS = 2_000_000  # tokens per domain held out from training, used only for model selection
+    raw_pools = [data.read_tokens(os.path.join(ROOT, "pool", f"{d}.bin")) for d in DOMAINS]
+    pools = [p[:-VAL_TOKENS] for p in raw_pools]              # training split
+    val_pools = dict(zip(DOMAINS, (p[-VAL_TOKENS:] for p in raw_pools)))  # validation split
     rng = np.random.default_rng(args.seed)
 
     def get_batch(n):
-        """n random windows of seq_len + 1 tokens: inputs, and the next-token targets."""
+        """n random windows of seq_len + 1 tokens from the training split: inputs, and the next-token targets."""
         rows = []
         for _ in range(n):
             pool = pools[rng.integers(len(pools))]
@@ -85,6 +88,26 @@ def main():
             rows.append(pool[start:start + seq_len + 1])
         xy = torch.from_numpy(np.stack(rows).astype(np.int64)).to(device)
         return xy[:, :-1], xy[:, 1:]
+
+    @torch.no_grad()
+    def val_loss():
+        """Mean next-token cross-entropy over non-overlapping windows of each domain's held-out tokens."""
+        model.eval()
+        losses = {}
+        for d, tokens in val_pools.items():
+            n = (len(tokens) - 1) // seq_len
+            t = torch.from_numpy(tokens[:n * seq_len + 1].astype(np.int64)).to(device)
+            total = 0.0
+            for start in range(0, n, 4):
+                b = min(4, n - start)
+                chunk = t[start * seq_len:(start + b) * seq_len + 1]
+                x, y = chunk[:-1].view(b, seq_len), chunk[1:].view(b, seq_len)
+                with torch.autocast(device, dtype=torch.bfloat16):
+                    logits = model(x)
+                total += F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.reshape(-1), reduction="sum").item()
+            losses[d] = total / (n * seq_len)
+        model.train()
+        return losses
 
     # ---- 4. Optimizer: AdamW with the muP groups, linear warmup then linear decay to zero --------------
     optimizer = torch.optim.AdamW(gpt.optimizer_groups(model, args.weight_decay), lr=args.lr, betas=(0.9, 0.95),
@@ -114,6 +137,9 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         if (step + 1) % args.log_every == 0 or step + 1 == args.steps:
             log(f"step {step + 1}/{args.steps} | loss {step_loss:.4f} | lr {lr_at(step):.2e} | {time.time() - start:.0f}s")
+
+    vlosses = val_loss()
+    log("val  " + " | ".join(f"{d} {v:.4f}" for d, v in vlosses.items()) + f" | mean {sum(vlosses.values()) / len(vlosses):.4f}")
 
     # ---- 6. Save: the weights, and the model definition as model_def.py ---------------------------------
     torch.save({"config": asdict(model.config), "state_dict": model.state_dict()}, os.path.join(args.out, "model.pt"))
